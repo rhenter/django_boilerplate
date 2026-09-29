@@ -63,6 +63,7 @@ django_boilerplate/
 | Django REST Framework | Autenticação por sessão e permissão de usuário autenticado por padrão; paginação, busca, ordenação e filtros configurados. |
 | Banco, cache e arquivos | SQLite, cache em memória e arquivos locais por padrão; PostgreSQL e Redis podem ser configurados por ambiente. |
 | Celery | Aplicação configurada e autodiscovery de tarefas; requer um broker em execução para processá-las. |
+| Django Celery Logs | Registra execuções e falhas das tarefas no banco e permite consultá-las no admin. |
 
 O `core` também fornece `TimestampedModel`, uma classe abstrata opcional com `created_at` e `updated_at`. As URLs registram apenas o admin padrão e as duas apps iniciais. A base não traz `admin_custom.py`, tarefas de domínio ou integrações privadas do Hydrostats.
 
@@ -77,7 +78,7 @@ O `core` também fornece `TimestampedModel`, uma classe abstrata opcional com `c
 | `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS`, `CORS_ALLOWED_ORIGINS`, `CORS_ALLOW_CREDENTIALS` | Hosts e origens permitidos. Listas usam valores separados por vírgula. |
 | `DATABASE_URL`, `DB_CONN_MAX_AGE` | Banco de dados e persistência de conexões. Sem URL, usa SQLite na raiz. |
 | `CACHE_URL` | Habilita cache Redis; sem URL, usa cache em memória. |
-| `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND` | Broker e backend opcional de resultados. O broker padrão é `redis://localhost:6379/0`. |
+| `CELERY_BROKER_URL` | Broker das tarefas. O padrão é `redis://localhost:6379/0`. Os resultados do Celery são ignorados; o histórico fica no Django Celery Logs. |
 | `LANGUAGE_CODE`, `TIME_ZONE`, `API_PAGE_SIZE` | Idioma, fuso horário e tamanho da página da API. |
 | `STATIC_URL`, `MEDIA_URL` | URLs de arquivos estáticos e uploads. |
 | `SECURE_SSL_REDIRECT`, `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE`, `SECURE_HSTS_SECONDS`, `SECURE_HSTS_INCLUDE_SUBDOMAINS`, `SECURE_HSTS_PRELOAD` | Opções de HTTPS e cookies para o ambiente de implantação. |
@@ -90,6 +91,15 @@ uv sync --extra postgres --group test
 ```
 
 Redis só é necessário quando `CACHE_URL` aponta para ele ou quando tarefas Celery usam um broker Redis. Antes de publicar, configure a chave secreta, hosts, origens e opções de HTTPS para o ambiente; execute `uv run python src/manage.py check --deploy` e `uv run python src/manage.py collectstatic`. A publicação dos arquivos estáticos e de mídia depende da infraestrutura escolhida.
+
+Para registrar tarefas com o [Django Celery Logs](https://github.com/rhenter/django-celery-logs), aplique as migrações e inicie um worker com o broker em execução:
+
+```sh
+uv run python src/manage.py migrate
+uv run celery --workdir src -A django_settings worker --loglevel=info
+```
+
+As execuções aparecem no admin em `/admin/`. A biblioteca fornece `clear_celery_task_logs` para limpar registros antigos; agende essa tarefa se precisar de retenção automática e configure `CELERY_TASK_LOGS_EXPIRES` com o número de dias desejado. O boilerplate usa `CELERY_TASK_IGNORE_RESULT = True`, portanto código que consulte `AsyncResult` precisará de um backend de resultados próprio.
 
 ## Comandos de desenvolvimento
 
@@ -108,7 +118,7 @@ Os testes usam execução paralela, reutilização do banco e cobertura mínima 
 
 ## Adaptação da base
 
-Adicione apps, dependências e serviços de domínio conforme as necessidades do novo projeto. Se não usar Celery, remova `src/django_settings/celery.py`, sua importação em `src/django_settings/__init__.py`, as opções `CELERY_*` em `settings.py` e a dependência no `pyproject.toml`.
+Adicione apps, dependências e serviços de domínio conforme as necessidades do novo projeto. Se não usar Celery, remova `src/django_settings/celery.py`, sua importação em `src/django_settings/__init__.py`, as opções `CELERY_*` em `settings.py`, a app `django_celery_logs` de `INSTALLED_APPS` e as dependências de Celery e Django Celery Logs do `pyproject.toml`.
 
 Quando validada em um projeto novo, esta base pode ser guardada em um [repositório template do GitHub](https://docs.github.com/en/repositories/creating-and-managing-repositories/creating-a-template-repository). Uma skill pode orientar a criação do repositório, a troca de identificadores, a seleção de integrações e as verificações, apontando para o template como fonte única do código inicial.
 
