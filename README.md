@@ -10,7 +10,7 @@ Base copiável para projetos Django novos, extraída do Hydrostats sem seus mód
 
 ## Início rápido
 
-Em um repositório novo, copie os arquivos desta base sem a `.venv/`, o `.env` local ou bancos de dados gerados. Ajuste o nome do projeto em `pyproject.toml`, `APP_NAME` em `local.env` e a descrição deste README. Então, na raiz do projeto:
+Em um repositório novo, copie os arquivos desta base. Ajuste o nome do projeto em `pyproject.toml`, `APP_NAME` em `local.env` e a descrição deste README. Então, na raiz do projeto:
 
 ```sh
 cp local.env .env
@@ -31,7 +31,6 @@ O servidor de desenvolvimento usa `http://127.0.0.1:8000/`. Acesse `/api/core/he
 ```text
 django_boilerplate/
 ├── .gitignore
-├── DJANGO_BOILERPLATE.md
 ├── Makefile
 ├── README.md
 ├── local.env
