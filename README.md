@@ -4,7 +4,7 @@ Base copiável para projetos Django novos, extraída do Hydrostats sem seus mód
 
 ## Requisitos
 
-- Python 3.12 ou superior;
+- Python 3.14 ou superior;
 - [uv](https://docs.astral.sh/uv/) para instalar as dependências e executar os comandos;
 - PostgreSQL e Redis somente se você optar pelas integrações correspondentes.
 
@@ -122,4 +122,4 @@ Adicione apps, dependências e serviços de domínio conforme as necessidades do
 
 Quando validada em um projeto novo, esta base pode ser guardada em um [repositório template do GitHub](https://docs.github.com/en/repositories/creating-and-managing-repositories/creating-a-template-repository). Uma skill pode orientar a criação do repositório, a troca de identificadores, a seleção de integrações e as verificações, apontando para o template como fonte única do código inicial.
 
-Referências: [modelo de usuário customizado no Django](https://docs.djangoproject.com/en/5.2/topics/auth/customizing/) e [skills na documentação da OpenAI](https://developers.openai.com/plugins/build/skills).
+Referências: [modelo de usuário customizado no Django](https://docs.djangoproject.com/en/6.1/topics/auth/customizing/) e [skills na documentação da OpenAI](https://developers.openai.com/plugins/build/skills).
