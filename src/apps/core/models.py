@@ -1,11 +1,356 @@
-from django.db import models
+import logging
+
+from django.conf import settings
+from django.contrib.admin.models import LogEntry
+from django.core.exceptions import ValidationError
+from django.db import models, transaction
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _, get_language
+from django_ckeditor_5.fields import CKEditor5Field
+from django_models.models import SignalsModel, UUIDModel, TimestampedModel
+from django_models.models.generic import CodeModel
+from django_models.models.managers import SignalsManager
+
+from apps.core.constants import ContactType, UF_CHOICES
+from apps.payment_providers.fields import EncryptedTextField
+from django_settings.utils import smtp_certificate_upload_path
+
+logger = logging.getLogger(__name__)
 
 
-class TimestampedModel(models.Model):
-    """Optional abstract base for models that need creation/update timestamps."""
+class SortOrderModel(models.Model):
+    """
+    Abstract model that provides sort order functionality for models.
+    
+    Automatically manages sort order for model instances, ensuring proper
+    sequencing when creating new records.
+    """
+    sort_order = models.PositiveIntegerField(default=0, blank=False, null=False, verbose_name=_("Sort"))
 
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    class Meta:
+        abstract = True
+
+    def _get_next_sort_order(self):
+        if self.sort_order:
+            return self.sort_order
+
+        sort_order = 0
+        if self.sort_order == 0:
+            sort_order = 1
+
+        last_instance = type(self).objects.last()
+        if last_instance:
+            sort_order = last_instance.sort_order + 1
+        return sort_order
+
+
+class BaseModel(CodeModel, TimestampedModel, UUIDModel, SignalsModel):
+    """
+    Base abstract model that combines common functionality.
+    
+    Inherits from CodeModel (provides code/name fields), TimestampedModel 
+    (automatic timestamps), UUIDModel (UUID primary key), and SignalsModel 
+    (Django signals integration).
+    """
+
+    class Meta:
+        abstract = True
+
+    _default_manager = SignalsManager
+
+
+class ContactRequest(BaseModel):
+    email = models.EmailField(verbose_name=_("Email"))
+    name = models.CharField(max_length=255, verbose_name=_("Name"))
+    phone = models.CharField(max_length=30, blank=True, default="", verbose_name=_("Phone"))
+    subject = models.CharField(max_length=160, blank=True, default="", verbose_name=_("Subject"))
+    contact_type = models.CharField(
+        max_length=20,
+        choices=ContactType.choices,
+        default=ContactType.OTHER,
+        verbose_name=_("Contact type"),
+    )
+    message = models.TextField(blank=True, default="", verbose_name=_("Message"))
+    is_read = models.BooleanField(default=False, verbose_name=_("Read"))
+    read_at = models.DateTimeField(null=True, blank=True, verbose_name=_("Read at"))
+    read_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="read_contact_requests",
+        verbose_name=_("Read by"),
+    )
+    status = models.CharField(max_length=20, default="new", verbose_name=_("Status"))
+    source = models.CharField(max_length=40, blank=True, default="", verbose_name=_("Source"))
+    page_url = models.CharField(max_length=500, blank=True, default="", verbose_name=_("Page URL"))
+    referrer = models.CharField(max_length=500, blank=True, default="", verbose_name=_("Referrer"))
+    user_agent = models.CharField(max_length=512, blank=True, default="", verbose_name=_("User agent"))
+    ip_address = models.GenericIPAddressField(null=True, blank=True, verbose_name=_("IP address"))
+
+    class Meta:
+        verbose_name = _("Contact request")
+        verbose_name_plural = _("Contact requests")
+
+    def __str__(self):
+        return f"{self.name} <{self.email}>"
+
+    def save(self, *args, **kwargs):
+        if self.is_read and self.read_at is None:
+            update_fields = kwargs.get("update_fields")
+            if update_fields is not None and "read_at" not in update_fields:
+                kwargs["update_fields"] = (*update_fields, "read_at")
+        super().save(*args, **kwargs)
+
+    def pre_save(self, save_kwargs) -> None:
+        if self.is_read and self.read_at is None:
+            self.read_at = timezone.now()
+
+    def post_save(self, save_kwargs) -> None:
+        if not save_kwargs.get("is_creation"):
+            return
+
+        from apps.notification.tasks import process_contact_request
+
+        contact_id = str(self.pk)
+
+        def enqueue_notification():
+            try:
+                process_contact_request.delay(contact_id)
+            except Exception:
+                logger.exception(
+                    "Could not enqueue contact notification",
+                    extra={"contact_request_id": contact_id},
+                )
+
+        from django.db import transaction
+        transaction.on_commit(enqueue_notification)
+
+
+class LegalDocumentQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("Published legal documents are immutable. Create a new version.")
+
+    def bulk_update(self, objs, fields, **kwargs):
+        raise ValidationError("Published legal documents are immutable. Create a new version.")
+
+    def bulk_create(self, objs, **kwargs):
+        raise ValidationError("Create legal documents individually to validate their publication.")
+
+    def delete(self):
+        raise ValidationError("Legal document history cannot be deleted.")
+
+
+class LegalDocument(BaseModel):
+    published_at = models.DateTimeField(default=timezone.now, db_index=True)
+    objects = SignalsManager.from_queryset(LegalDocumentQuerySet)()
+
+    class Meta:
+        abstract = True
+
+    def clean(self):
+        super().clean()
+        if not self.text.strip() or "[DATA]" in self.text:
+            raise ValidationError({"text": "Provide the final document, including its update date."})
+        if self.version < 1:
+            raise ValidationError({"version": "The version must be positive."})
+        if self.published_at > timezone.now():
+            raise ValidationError({"published_at": "Publication cannot be in the future."})
+        if type(self).objects.filter(version=self.version).exclude(pk=self.pk).exists():
+            raise ValidationError({"version": "This version has already been published."})
+        if self._state.adding and type(self).objects.filter(version__gte=self.version).exists():
+            raise ValidationError({"version": "Publish a version greater than the current version."})
+
+    @transaction.atomic
+    def save(self, *args, **kwargs):
+        previous = type(self).objects.select_for_update().filter(pk=self.pk).first()
+        if previous and any(getattr(previous, name) != getattr(self, name)
+                            for name in ("version", "text", "published_at")):
+            raise ValidationError("Published legal documents are immutable. Create a new version.")
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Legal document history cannot be deleted.")
+
+
+class TermsOfService(LegalDocument):
+    class TermsOfServiceTypes(models.TextChoices):
+        USER = 'user', _('User')
+        STORE = 'store', _('Store')
+
+    version = models.PositiveIntegerField(
+        blank=True, default=settings.TERMS_OF_USE_VERSION_CURRENT,
+        verbose_name=_('Version'),
+    )
+    text = CKEditor5Field(
+        _('Terms of Service text'), blank=True,
+        help_text=_('The actual terms of service content')
+    )
+
+    class Meta:
+        verbose_name = _('Terms of Service')
+        verbose_name_plural = _('Terms of service')
+        constraints = [models.UniqueConstraint(fields=("version",), name="unique_terms_version")]
+
+
+class PrivacyPolicy(LegalDocument):
+    version = models.PositiveIntegerField(
+        blank=True, default=settings.PRIVACY_POLICY_VERSION_CURRENT,
+        verbose_name=_('Version'),
+    )
+    text = CKEditor5Field(
+        _('Privacy policy text'), blank=True,
+        help_text=_('The actual privacy policy content')
+    )
+
+    class Meta:
+        verbose_name = _('Privacy policy')
+        verbose_name_plural = _('Privacy policies')
+        constraints = [models.UniqueConstraint(fields=("version",), name="unique_privacy_version")]
+
+
+class SMTPSettings(BaseModel):
+    """
+    Database-backed email transport settings (SMTP or Brevo HTTPS).
+    
+    Stores email server connection details and security settings
+    for sending emails from the application. Only one configuration
+    can be active at a time.
+    """
+    class TransportChoices(models.TextChoices):
+        SMTP = 'smtp', 'SMTP'
+        BREVO_API = 'brevo_api', 'Brevo HTTPS API'
+
+    transport = models.CharField(max_length=20, choices=TransportChoices.choices,
+                                 default=TransportChoices.SMTP, verbose_name=_('Transport'))
+    brevo_api_key = EncryptedTextField(blank=True, default='', verbose_name=_('Brevo API key'))
+    host = models.CharField(max_length=200, blank=True, verbose_name=_('Host'),
+                            help_text=_('SMTP server hostname or IP address'))
+    port = models.IntegerField(blank=True, verbose_name=_('Port'),
+                               help_text=_('SMTP server port (usually 587 for TLS or 465 for SSL)'))
+    username = models.CharField(max_length=128, blank=True, verbose_name=_('User'),
+                                help_text=_('Username for SMTP authentication'))
+    password = models.CharField(max_length=128, blank=True, verbose_name=_('Password'),
+                                help_text=_('Password for SMTP authentication'))
+    use_tls = models.BooleanField(default=False, verbose_name=_('Use TLS'),
+                                  help_text=_('Enable TLS encryption for secure connection'))
+    use_ssl = models.BooleanField(default=False, verbose_name=_('Use SSL'),
+                                  help_text=_('Enable SSL encryption for secure connection'))
+    timeout = models.IntegerField(blank=True, default=10, verbose_name=_('Timeout'),
+                                  help_text=_('Connection timeout in seconds'))
+    ssl_keyfile = models.FileField(upload_to=smtp_certificate_upload_path, blank=True, null=True,
+                                   verbose_name=_('SSL Keyfile'),
+                                   help_text=_('SSL private key file for client certificate authentication'))
+    ssl_certfile = models.FileField(upload_to=smtp_certificate_upload_path, blank=True, null=True,
+                                    verbose_name=_('SSL Certfile'),
+                                    help_text=_('SSL certificate file for client certificate authentication'))
+    is_active = models.BooleanField(default=False, verbose_name=_('Active'),
+                                    help_text=_('Whether this SMTP configuration is currently active'))
+
+    class Meta:
+        verbose_name = _('Email Settings')
+        verbose_name_plural = _('Email Settings')
+
+    def __str__(self):
+        return '{}:{}'.format(self.host, self.port)
+
+    def pre_save(self, save_kwargs):
+        if save_kwargs["is_creation"] and type(self).objects.exists():
+            raise ValueError("This model has already its record.")
+
+
+class AuditLogEntry(LogEntry):
+    """
+    Proxy model for Django's LogEntry to provide audit logging functionality.
+    
+    Extends Django's built-in admin log to track administrative actions
+    and changes made through the admin interface for auditing purposes.
+    """
+
+    class Meta:
+        proxy = True
+        verbose_name = _('Audit Log')
+        verbose_name_plural = _('Audit Logs')
+        ordering = ['-action_time']
+
+    def __str__(self):
+        return f"{self.action_time:%Y-%m-%d %H:%M:%S} / {self.object_repr}"
+
+
+class TranslatableFieldMixin:
+    label = None
+    help_text = None
+    title = None
+
+    class Meta:
+        abstract = True
+
+    @property
+    def label_text(self) -> str:
+        return self._get_i18n(self.label)
+
+    @property
+    def help_text_text(self) -> str:
+        return self._get_i18n(self.help_text)
+
+    @property
+    def title_text(self) -> str:
+        return self._get_i18n(self.title)
+
+    def _get_i18n(self, data, default_lang='en', fallbacks=("en", "pt-br", "es")) -> str:
+        lang = (get_language() or default_lang).lower()
+        # normalize pt-br
+        if lang in {"pt", "pt_br", "pt-br"}: lang = "pt-br"
+        if data is None:
+            return ""
+        # Handle string data - return as is
+        if isinstance(data, str):
+            return data
+        # Handle dictionary data
+        if isinstance(data, dict):
+            if lang in data and data[lang]:
+                return data[lang]
+            # configurable fallbacks
+            for fb in fallbacks:
+                if fb in data and data[fb]:
+                    return data[fb]
+            # last resort: first value
+            return next(iter(data.values()), "")
+        # Handle other types by converting to string
+        return str(data) if data else ""
+
+    def pre_save(self, save_kwargs):
+        # Ensure new instances have proper i18n structure
+        if save_kwargs["is_creation"]:
+            if not self.label or self.label == {}:
+                self.label = {
+                    "en": "",
+                    "pt-br": "",
+                    "es": ""
+                }
+            if not self.help_text or self.help_text == {}:
+                self.help_text = {
+                    "en": "",
+                    "pt-br": "",
+                    "es": ""
+                }
+
+
+class AddressFieldsMixin(models.Model):
+    address_street = models.CharField(max_length=255, blank=True, default="", verbose_name=_("Street"))
+    address_number = models.CharField(max_length=255, blank=True, default="", verbose_name=_("Number"))
+    address_complement = models.CharField(max_length=255, blank=True, default="", verbose_name=_("Complement"))
+    address_neighborhood = models.CharField(max_length=255, blank=True, default="", verbose_name=_("Neighborhood"))
+    address_city = models.CharField(max_length=255, blank=True, default="", verbose_name=_("City"))
+    address_uf = models.CharField(
+        max_length=2,
+        choices=UF_CHOICES,
+        blank=True,
+        default="",
+        verbose_name=_("State (UF)"),
+    )
+    address_zip_code = models.CharField(max_length=12, blank=True, default="", verbose_name=_("Zip Code"))
 
     class Meta:
         abstract = True

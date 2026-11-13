@@ -1,10 +1,11 @@
 from rest_framework.routers import DefaultRouter
 
-from .views import UserViewSet
-
-app_name = "user"
+from . import views
 
 router = DefaultRouter()
-router.register("users", UserViewSet, basename="user")
+
+app_name = 'api-user'
+
+router.register(r'users', views.UserViewSet, basename='users')
 
 urlpatterns = router.urls
